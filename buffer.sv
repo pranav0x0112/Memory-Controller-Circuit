@@ -1,5 +1,5 @@
 module buffer #(
-    parameter int DEPTH = 1024,           // FIFO depth (must be power of 2)
+    parameter int DEPTH = 1024,           // FIFO depth
     parameter int WIDTH = 32,             // Data width in bits
     parameter int ADDR_W = $clog2(DEPTH)  // Address width
 )(
@@ -18,12 +18,12 @@ module buffer #(
     output logic [WIDTH-1:0]  te_data_out   // Read data
 );
 
-    // memory Array (Write Clock Domain only)
+    // memory Array (write clock domain only)
     logic [WIDTH-1:0] mem [0:DEPTH-1];
     logic [ADDR_W:0] wr_ptr_bin, rd_ptr_bin;
     logic [ADDR_W:0] wr_ptr_gray, rd_ptr_gray;
     
-    // Synchronized Gray pointers in opposite domains
+    // synchronized gray pointers in opposite domains
     logic [ADDR_W:0] wr_ptr_gray_sync1, wr_ptr_gray_sync2;
     logic [ADDR_W:0] rd_ptr_gray_sync1, rd_ptr_gray_sync2;  
 
@@ -57,8 +57,8 @@ module buffer #(
             rd_ptr_gray_sync1 <= '0;
             rd_ptr_gray_sync2 <= '0;
         end else begin
-            rd_ptr_gray_sync1 <= rd_ptr_gray;      // First stage (metastability)
-            rd_ptr_gray_sync2 <= rd_ptr_gray_sync1; // Second stage (stable)
+            rd_ptr_gray_sync1 <= rd_ptr_gray;      
+            rd_ptr_gray_sync2 <= rd_ptr_gray_sync1;
         end
     end
     
