@@ -73,7 +73,7 @@ module buffer #(
     assign re_credit = DEPTH[ADDR_W:0] - (wr_ptr_bin - rd_ptr_bin_synced);
 
     // read clock domain implementation
-
+    wire data_available = (wr_ptr_bin_synced != rd_ptr_bin);
     wire rd_enable = te_ready && data_available;
     
     // read pointer binary counter and gray code generation
@@ -105,10 +105,6 @@ module buffer #(
             wr_ptr_bin_synced[i] = wr_ptr_bin_synced[i+1] ^ wr_ptr_gray_sync2[i];
         end
     end
-    
-
-    wire data_available = (wr_ptr_bin_synced != rd_ptr_bin);
-    wire rd_enable = te_ready && data_available;
     
     // read data output: memory read is asynchronous, but output is registered in read domain
     always_ff @(posedge te_clk or negedge te_reset_n) begin
