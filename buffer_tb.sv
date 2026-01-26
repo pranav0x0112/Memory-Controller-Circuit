@@ -10,13 +10,13 @@ module buffer_tb;
     parameter real RD_CLK_PERIOD = 15; 
 
     logic              re_clk;
-    logic              re_reset;
+    logic              re_reset_n;      
     logic              re_valid;
     logic [WIDTH-1:0]  data_in;
     logic [ADDR_W:0]   re_credit;
     
     logic              te_clk;
-    logic              te_reset;
+    logic              te_reset_n;      
     logic              te_ready;
     logic              te_valid;
     logic [WIDTH-1:0]  te_data_out;
@@ -33,12 +33,12 @@ module buffer_tb;
         .ADDR_W(ADDR_W)
     ) dut (
         .re_clk(re_clk),
-        .re_reset(re_reset),
+        .re_reset_n(re_reset_n),        // CHANGED
         .re_valid(re_valid),
         .data_in(data_in),
         .re_credit(re_credit),
         .te_clk(te_clk),
-        .te_reset(te_reset),
+        .te_reset_n(te_reset_n),        // CHANGED
         .te_ready(te_ready),
         .te_valid(te_valid),
         .te_data_out(te_data_out)
@@ -55,16 +55,16 @@ module buffer_tb;
     end
 
     always @(posedge re_clk) begin
-        if (!re_reset && re_valid && re_credit != 0) begin
+        if (re_reset_n && re_valid && re_credit != 0) begin  // CHANGED: Check re_reset_n high
             $display("[WRITE] Time=%0t, Data=0x%08h, Ptr=%0d, Credits=%0d", 
-                     $time, data_in, dut.wr_ptr, re_credit);
+                     $time, data_in, dut.wr_ptr_bin[ADDR_W-1:0], re_credit);  // CHANGED: wr_ptr_bin
             expected_data_queue.push_back(data_in);
             write_count++;
         end
     end
     
     always @(posedge te_clk) begin
-        if (!te_reset && te_valid && te_ready) begin
+        if (te_reset_n && te_valid && te_ready) begin  // CHANGED: Check te_reset_n high
             logic [WIDTH-1:0] expected;
             
             if (expected_data_queue.size() > 0) begin
@@ -76,7 +76,7 @@ module buffer_tb;
                     error_count++;
                 end else begin
                     $display("[READ OK] Time=%0t, Data=0x%08h, Ptr=%0d", 
-                             $time, te_data_out, dut.rd_ptr);
+                             $time, te_data_out, dut.rd_ptr_bin[ADDR_W-1:0]);  // CHANGED: rd_ptr_bin
                 end
             end else begin
                 $error("[READ ERROR] Unexpected read! No data expected but got 0x%08h", 
@@ -90,7 +90,7 @@ module buffer_tb;
 
     logic [ADDR_W:0] prev_credit;
     always @(posedge re_clk) begin
-        if (!re_reset) begin
+        if (re_reset_n) begin  // CHANGED: Check re_reset_n high
             if (re_credit !== prev_credit) begin
                 $display("[CREDIT] Time=%0t, Credits: %0d -> %0d (Change: %0d)", 
                          $time, prev_credit, re_credit, 
@@ -101,17 +101,17 @@ module buffer_tb;
     end
 
     task reset_system();
-        re_reset = 1;
-        te_reset = 1;
+        re_reset_n = 0;      // CHANGED: Assert low
+        te_reset_n = 0;      // CHANGED: Assert low
         re_valid = 0;
         te_ready = 0;
         data_in = 0;
         
         repeat(5) @(posedge re_clk);
-        re_reset = 0;
+        re_reset_n = 1;      // CHANGED: Deassert (go high)
         
         repeat(5) @(posedge te_clk);
-        te_reset = 0;
+        te_reset_n = 1;      // CHANGED: Deassert (go high)
         
         repeat(10) @(posedge re_clk);
         $display("\n=== RESET COMPLETE ===\n");
@@ -166,7 +166,8 @@ module buffer_tb;
         
         $display("Writes completed before credit exhaustion: %0d", writes_before_stop);
         $display("Final credits: %0d", re_credit);
-        $display("Write pointer: %0d, Read pointer: %0d\n", dut.wr_ptr, dut.rd_ptr);
+        $display("Write pointer: %0d, Read pointer: %0d\n", 
+                 dut.wr_ptr_bin[ADDR_W-1:0], dut.rd_ptr_bin[ADDR_W-1:0]);  // CHANGED
 
         $display("Step 3: Reading to return credits...");
         fork
@@ -203,7 +204,7 @@ module buffer_tb;
         write_items(DEPTH - 2, 0);
         repeat(20) @(posedge re_clk);
         
-        wr_ptr_before = dut.wr_ptr;
+        wr_ptr_before = dut.wr_ptr_bin[ADDR_W-1:0];  // CHANGED
         $display("Write pointer at: %0d (next write wraps to 0)", wr_ptr_before);
 
         $display("\nStep 2: Reading 6 items to create space...");
@@ -212,7 +213,7 @@ module buffer_tb;
         te_ready = 0;
         repeat(30) @(posedge re_clk);  
         
-        rd_ptr_before = dut.rd_ptr;
+        rd_ptr_before = dut.rd_ptr_bin[ADDR_W-1:0];  // CHANGED
         $display("Read pointer now at: %0d", rd_ptr_before);
         $display("Credits available: %0d", re_credit);
         $display("Physical space: positions 0-5 are free (6 slots)");
@@ -228,24 +229,24 @@ module buffer_tb;
                 data_in = $random;
                 safe_writes++;
                 $display("  Write %0d: ptr=%0d, credits=%0d", 
-                         safe_writes, dut.wr_ptr, re_credit);
+                         safe_writes, dut.wr_ptr_bin[ADDR_W-1:0], re_credit);  // CHANGED
                 @(posedge re_clk);
                 re_valid = 0;
             end else begin
                 re_valid = 0;
-                $display("  STOPPED: Credits exhausted at ptr=%0d", dut.wr_ptr);
+                $display("  STOPPED: Credits exhausted at ptr=%0d", dut.wr_ptr_bin[ADDR_W-1:0]);  // CHANGED
             end
         end
         re_valid = 0;
         
         $display("\nResults:");
         $display("  Total safe writes before stop: %0d", safe_writes);
-        $display("  Write pointer stopped at: %0d", dut.wr_ptr);
-        $display("  Read pointer at: %0d", dut.rd_ptr);
+        $display("  Write pointer stopped at: %0d", dut.wr_ptr_bin[ADDR_W-1:0]);  // CHANGED
+        $display("  Read pointer at: %0d", dut.rd_ptr_bin[ADDR_W-1:0]);  // CHANGED
         $display("  Safety margin: %0d positions", 
-                 (rd_ptr_before - dut.wr_ptr + DEPTH) % DEPTH);
+                 (rd_ptr_before - dut.wr_ptr_bin[ADDR_W-1:0] + DEPTH) % DEPTH);  // CHANGED
         $display("\nExpected: Stop at position 1-3 (with 2-stage synchronizer)");
-        $display("Actual stop position: %0d\n", dut.wr_ptr);
+        $display("Actual stop position: %0d\n", dut.wr_ptr_bin[ADDR_W-1:0]);  // CHANGED
     endtask
 
     task test_burst_transfers();
@@ -271,36 +272,35 @@ module buffer_tb;
         $display("Burst test complete.\n");
     endtask
 
-task test_overflow_protection();
-    $display("\n========================================");
-    $display("TEST: Overflow Protection");
-    $display("========================================\n");
-    
-    $display("Attempting to write %0d items (more than depth %0d)...", 
-             DEPTH + 10, DEPTH);
-    
-    fork
-        begin
-            write_items(DEPTH + 10, 0);
+    task test_overflow_protection();
+        $display("\n========================================");
+        $display("TEST: Overflow Protection");
+        $display("========================================\n");
+        
+        $display("Attempting to write %0d items (more than depth %0d)...", 
+                 DEPTH + 10, DEPTH);
+        
+        fork
+            begin
+                write_items(DEPTH + 10, 0);
+            end
+        join
+        
+        repeat(50) @(posedge re_clk);
+        
+        if (re_credit == 0) begin
+            $display("✓ PASS: Buffer correctly stopped accepting writes");
+            $display("  Final credits: %0d", re_credit);
+        end else begin
+            $error("✗ FAIL: Buffer should have zero credits!");
         end
-    join
-    
-    repeat(50) @(posedge re_clk);
-    
-    if (re_credit == 0) begin
-        $display("✓ PASS: Buffer correctly stopped accepting writes");
-        $display("  Final credits: %0d", re_credit);
-    end else begin
-        $error("✗ FAIL: Buffer should have zero credits!");
-    end
-    
-    // FLUSH THE BUFFER!
-    $display("Flushing buffer...");
-    te_ready = 1;
-    repeat(100) @(posedge te_clk);
-    te_ready = 0;
-    repeat(20) @(posedge re_clk);
-endtask
+        
+        $display("Flushing buffer...");
+        te_ready = 1;
+        repeat(100) @(posedge te_clk);
+        te_ready = 0;
+        repeat(20) @(posedge re_clk);
+    endtask
 
     initial begin
         $display("\n");
