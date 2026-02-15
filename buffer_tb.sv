@@ -1,362 +1,289 @@
+// tb_async_fifo_credit.sv
+// Self-checking testbench for async_fifo_credit
+//
+// Scenarios
+//   1. wr faster  (wr=10ns  rd=25ns)
+//   2. rd faster  (wr=25ns  rd=14ns)  within f_rd/f_wr < 2 constraint
+//   3. equal      (wr=15ns  rd=15ns)
+//   4. back-pressure (equal clocks, rd_ready toggled randomly)
+//   5. async ratio (wr=7ns  rd=11ns)
+//   6. fill-to-full then drain
+//
+// Scoreboard  : queue of written words; each read pops and compares
+// Credit check: credit_pulse count must equal write-accepted count at end
+
 `timescale 1ns/1ps
 
-module buffer_tb;
+module tb_async_fifo_credit;
 
-    parameter int DEPTH = 16; 
-    parameter int WIDTH = 32;
-    parameter int ADDR_W = $clog2(DEPTH);
+    // DUT parameters
+    localparam int DW    = 32;
+    localparam int DEPTH = 16;
 
-    parameter real WR_CLK_PERIOD = 10; 
-    parameter real RD_CLK_PERIOD = 15; 
+    // clocks and resets
+    logic wr_clk, rd_clk;
+    logic wr_rst_n, rd_rst_n;
 
-    logic              re_clk;
-    logic              re_reset_n;      
-    logic              re_valid;
-    logic [WIDTH-1:0]  data_in;
-    logic [ADDR_W:0]   re_credit;
-    
-    logic              te_clk;
-    logic              te_reset_n;      
-    logic              te_ready;
-    logic              te_valid;
-    logic [WIDTH-1:0]  te_data_out;
+    // DUT ports
+    logic          wr_valid;
+    logic [DW-1:0] wr_data;
+    logic          wr_credit_pulse;
+    logic          rd_valid;
+    logic          rd_ready;
+    logic [DW-1:0] rd_data;
 
-    int write_count = 0;
-    int read_count = 0;
-    int error_count = 0;
-
-    logic [WIDTH-1:0] expected_data_queue[$];
-    
-    buffer #(
-        .DEPTH(DEPTH),
-        .WIDTH(WIDTH),
-        .ADDR_W(ADDR_W)
+    // DUT
+    async_fifo_credit #(
+        .DEPTH  (DEPTH),
+        .DATA_W (DW)
     ) dut (
-        .re_clk(re_clk),
-        .re_reset_n(re_reset_n),        // CHANGED
-        .re_valid(re_valid),
-        .data_in(data_in),
-        .re_credit(re_credit),
-        .te_clk(te_clk),
-        .te_reset_n(te_reset_n),        // CHANGED
-        .te_ready(te_ready),
-        .te_valid(te_valid),
-        .te_data_out(te_data_out)
+        .wr_clk          (wr_clk),
+        .wr_rst_n        (wr_rst_n),
+        .wr_valid        (wr_valid),
+        .wr_data         (wr_data),
+        .wr_credit_pulse (wr_credit_pulse),
+        .rd_clk          (rd_clk),
+        .rd_rst_n        (rd_rst_n),
+        .rd_valid        (rd_valid),
+        .rd_ready        (rd_ready),
+        .rd_data         (rd_data)
     );
-    
+
+    // Scoreboard and counters
+    logic [DW-1:0] scoreboard [$];   // expected data queue
+    int            wr_count;         // words accepted by DUT
+    int            credit_count;     // wr_credit_pulse count
+
+    // Clock period knobs (set per scenario)
+    realtime WR_HALF, RD_HALF;
+
+    // Clocks
+    initial wr_clk = 0;
+    always #(WR_HALF) wr_clk = ~wr_clk;
+
+    initial rd_clk = 0;
+    always #(RD_HALF) rd_clk = ~rd_clk;
+
+    // Credit counter (wr_clk domain)
+    always_ff @(posedge wr_clk)
+        if (!wr_rst_n) credit_count <= 0;
+        else if (wr_credit_pulse) credit_count <= credit_count + 1;
+
+    // Scoreboard checker (rd_clk domain)
+    always_ff @(posedge rd_clk) begin
+        if (rd_valid && rd_ready) begin
+            logic [DW-1:0] expected;
+            if (scoreboard.size() == 0)
+                $error("[UNDERFLOW] read when scoreboard empty at %0t", $time);
+            else begin
+                expected = scoreboard.pop_front();
+                if (rd_data !== expected)
+                    $error("[DATA MISMATCH] got 0x%08h expected 0x%08h at %0t",
+                           rd_data, expected, $time);
+            end
+        end
+    end
+
+
+    // Task: reset both domains
+    task do_reset();
+        wr_rst_n = 0; rd_rst_n = 0;
+        wr_valid = 0; wr_data  = 0;
+        rd_ready = 0;
+        wr_count = 0; credit_count = 0;
+        scoreboard.delete();
+        repeat (4) @(posedge wr_clk);
+        repeat (4) @(posedge rd_clk);
+        @(posedge wr_clk); wr_rst_n = 1;
+        @(posedge rd_clk); rd_rst_n = 1;
+        repeat (2) @(posedge wr_clk);
+        repeat (2) @(posedge rd_clk);
+    endtask
+
+    // Task: write n words, one per wr_clk, stall on full
+    task write_words(int n);
+        for (int i = 0; i < n; i++) begin
+            @(posedge wr_clk);
+            while (dut.wr_full) @(posedge wr_clk);
+            wr_valid = 1;
+            wr_data  = $urandom();
+            @(posedge wr_clk);
+            scoreboard.push_back(wr_data);
+            wr_count++;
+            wr_valid = 0;
+        end
+    endtask
+
+    // Task: read n words, rd_ready always asserted
+    task read_words(int n);
+        rd_ready = 1;
+        for (int i = 0; i < n; i++) begin
+            @(posedge rd_clk);
+            while (!rd_valid) @(posedge rd_clk);
+        end
+        @(posedge rd_clk);
+        rd_ready = 0;
+    endtask
+
+    // Task: read n words with random back-pressure
+    task read_words_bp(int n);
+        int done = 0;
+        while (done < n) begin
+            @(posedge rd_clk);
+            rd_ready = $urandom_range(0, 1);
+            if (rd_valid && rd_ready) done++;
+        end
+        @(posedge rd_clk);
+        rd_ready = 0;
+    endtask
+
+    // Task: assert rd_ready until scoreboard is empty, then flush CDC pipeline
+    task drain();
+        rd_ready = 1;
+        while (scoreboard.size() > 0) @(posedge rd_clk);
+        repeat (10) @(posedge rd_clk);
+        rd_ready = 0;
+    endtask
+
+    // Task: wait for credit pipeline to flush then check count
+    task check_credits(string scenario);
+        repeat (20) @(posedge wr_clk);
+        if (credit_count !== wr_count)
+            $error("[%s] CREDIT MISMATCH: %0d pulses, %0d writes",
+                   scenario, credit_count, wr_count);
+        else
+            $display("[%s] PASS  credits=%0d  writes=%0d", scenario, credit_count, wr_count);
+    endtask
+
+    // Task: check scoreboard is empty
+    task check_sb(string scenario);
+        if (scoreboard.size() != 0)
+            $error("[%s] LEFTOVER: %0d entries in scoreboard", scenario, scoreboard.size());
+        else
+            $display("[%s] PASS  scoreboard empty", scenario);
+    endtask
+
+
+    // MAIN TEST
     initial begin
-        re_clk = 0;
-        forever #(WR_CLK_PERIOD/2) re_clk = ~re_clk;
-    end
-    
-    initial begin
-        te_clk = 0;
-        forever #(RD_CLK_PERIOD/2) te_clk = ~te_clk;
-    end
+        $dumpfile("tb_async_fifo_credit.vcd");
+        $dumpvars(0, tb_async_fifo_credit);
 
-    always @(posedge re_clk) begin
-        if (re_reset_n && re_valid && re_credit != 0) begin  // CHANGED: Check re_reset_n high
-            $display("[WRITE] Time=%0t, Data=0x%08h, Ptr=%0d, Credits=%0d", 
-                     $time, data_in, dut.wr_ptr_bin[ADDR_W-1:0], re_credit);  // CHANGED: wr_ptr_bin
-            expected_data_queue.push_back(data_in);
-            write_count++;
-        end
-    end
-    
-    always @(posedge te_clk) begin
-        if (te_reset_n && te_valid && te_ready) begin  // CHANGED: Check te_reset_n high
-            logic [WIDTH-1:0] expected;
-            
-            if (expected_data_queue.size() > 0) begin
-                expected = expected_data_queue.pop_front();
-                
-                if (te_data_out !== expected) begin
-                    $error("[READ ERROR] Time=%0t, Expected=0x%08h, Got=0x%08h", 
-                           $time, expected, te_data_out);
-                    error_count++;
-                end else begin
-                    $display("[READ OK] Time=%0t, Data=0x%08h, Ptr=%0d", 
-                             $time, te_data_out, dut.rd_ptr_bin[ADDR_W-1:0]);  // CHANGED: rd_ptr_bin
-                end
-            end else begin
-                $error("[READ ERROR] Unexpected read! No data expected but got 0x%08h", 
-                       te_data_out);
-                error_count++;
-            end
-            
-            read_count++;
-        end
-    end
 
-    logic [ADDR_W:0] prev_credit;
-    always @(posedge re_clk) begin
-        if (re_reset_n) begin  // CHANGED: Check re_reset_n high
-            if (re_credit !== prev_credit) begin
-                $display("[CREDIT] Time=%0t, Credits: %0d -> %0d (Change: %0d)", 
-                         $time, prev_credit, re_credit, 
-                         $signed(re_credit) - $signed(prev_credit));
-            end
-            prev_credit <= re_credit;
-        end
-    end
-
-    task reset_system();
-        re_reset_n = 0;      // CHANGED: Assert low
-        te_reset_n = 0;      // CHANGED: Assert low
-        re_valid = 0;
-        te_ready = 0;
-        data_in = 0;
-        
-        repeat(5) @(posedge re_clk);
-        re_reset_n = 1;      // CHANGED: Deassert (go high)
-        
-        repeat(5) @(posedge te_clk);
-        te_reset_n = 1;      // CHANGED: Deassert (go high)
-        
-        repeat(10) @(posedge re_clk);
-        $display("\n=== RESET COMPLETE ===\n");
-    endtask
-
-    task automatic write_items(int count, bit random_gaps = 0);
-        int i;
-        for (i = 0; i < count; i++) begin
-            re_valid = 1;
-            data_in = $random;
-            @(posedge re_clk);
-            re_valid = 0;
-            @(posedge re_clk);
-            
-            if (random_gaps && ($urandom % 4 == 0)) begin
-                @(posedge re_clk);
-            end
-        end
-    endtask
-
-    task test_cdc_latency();
-        int initial_credits;
-        int writes_before_stop;
-        
-        $display("\n========================================");
-        $display("TEST: CDC Latency Analysis");
-        $display("========================================\n");
-
-        $display("Step 1: Writing %0d items to partially fill buffer...", DEPTH - 5);
-        write_items(DEPTH - 5, 0);
-        repeat(20) @(posedge re_clk);  
-        
-        initial_credits = re_credit;
-        $display("Credits after partial fill: %0d", initial_credits);
-        $display("Expected credits: ~5\n");
-
-        $display("Step 2: Writing continuously until credits exhausted...");
-        writes_before_stop = 0;
-        
+        // ── 1. wr faster ──────────────────────────────────────────────────
+        WR_HALF = 5.0; RD_HALF = 12.5;  // wr=10ns  rd=25ns
+        $display("\n--- 1. wr faster (wr=10ns rd=25ns) ---");
+        do_reset();
         fork
-            begin
-                repeat(20) begin
-                    @(posedge re_clk);
-                    re_valid = 1;
-                    data_in = $random;
-                    if (re_credit > 0) writes_before_stop++;
-                    @(posedge re_clk);
-                    re_valid = 0;
-                end
-            end
+            write_words(20);
+            read_words(20);
         join
-        
-        $display("Writes completed before credit exhaustion: %0d", writes_before_stop);
-        $display("Final credits: %0d", re_credit);
-        $display("Write pointer: %0d, Read pointer: %0d\n", 
-                 dut.wr_ptr_bin[ADDR_W-1:0], dut.rd_ptr_bin[ADDR_W-1:0]);  // CHANGED
+        drain();
+        check_credits("wr_faster");
+        check_sb("wr_faster");
 
-        $display("Step 3: Reading to return credits...");
+
+        // ── 2. rd faster (within f_rd/f_wr < 2 constraint) ───────────────
+        WR_HALF = 12.5; RD_HALF = 7.0;  // wr=25ns  rd=14ns  ratio=0.56
+        $display("\n--- 2. rd faster within constraint (wr=25ns rd=14ns) ---");
+        do_reset();
         fork
-            begin
-                te_ready = 1;
-                repeat(100) @(posedge te_clk);
-                te_ready = 0;
-            end
-            begin
-                repeat(30) begin
-                    @(posedge re_clk);
-                    if (re_credit > 0) begin
-                        $display("  [CDC] Credits returned! Credits=%0d at time=%0t", 
-                                 re_credit, $time);
-                    end
-                end
-            end
+            write_words(20);
+            read_words(20);
         join
-        
-        repeat(50) @(posedge re_clk); 
-        $display("Final credits after reads: %0d\n", re_credit);
-    endtask
+        drain();
+        check_credits("rd_faster");
+        check_sb("rd_faster");
 
-    task test_wraparound_scenario();
-        int wr_ptr_before, rd_ptr_before;
-        int safe_writes;
-        
-        $display("\n========================================");
-        $display("TEST: Wraparound Scenario");
-        $display("Buffer depth = %0d", DEPTH);
-        $display("========================================\n");
 
-        $display("Step 1: Filling buffer close to wraparound...");
-        write_items(DEPTH - 2, 0);
-        repeat(20) @(posedge re_clk);
-        
-        wr_ptr_before = dut.wr_ptr_bin[ADDR_W-1:0];  // CHANGED
-        $display("Write pointer at: %0d (next write wraps to 0)", wr_ptr_before);
-
-        $display("\nStep 2: Reading 6 items to create space...");
-        te_ready = 1;
-        repeat(200) @(posedge te_clk);
-        te_ready = 0;
-        repeat(30) @(posedge re_clk);  
-        
-        rd_ptr_before = dut.rd_ptr_bin[ADDR_W-1:0];  // CHANGED
-        $display("Read pointer now at: %0d", rd_ptr_before);
-        $display("Credits available: %0d", re_credit);
-        $display("Physical space: positions 0-5 are free (6 slots)");
-        $display("But with 2-stage sync, safe credits should be ~3-4\n");
-
-        $display("Step 3: Writing continuously to test CDC safety margin...");
-        safe_writes = 0;
-        
-        repeat(10) begin
-            @(posedge re_clk);
-            if (re_credit > 0) begin
-                re_valid = 1;
-                data_in = $random;
-                safe_writes++;
-                $display("  Write %0d: ptr=%0d, credits=%0d", 
-                         safe_writes, dut.wr_ptr_bin[ADDR_W-1:0], re_credit);  // CHANGED
-                @(posedge re_clk);
-                re_valid = 0;
-            end else begin
-                re_valid = 0;
-                $display("  STOPPED: Credits exhausted at ptr=%0d", dut.wr_ptr_bin[ADDR_W-1:0]);  // CHANGED
-            end
-        end
-        re_valid = 0;
-        
-        $display("\nResults:");
-        $display("  Total safe writes before stop: %0d", safe_writes);
-        $display("  Write pointer stopped at: %0d", dut.wr_ptr_bin[ADDR_W-1:0]);  // CHANGED
-        $display("  Read pointer at: %0d", dut.rd_ptr_bin[ADDR_W-1:0]);  // CHANGED
-        $display("  Safety margin: %0d positions", 
-                 (rd_ptr_before - dut.wr_ptr_bin[ADDR_W-1:0] + DEPTH) % DEPTH);  // CHANGED
-        $display("\nExpected: Stop at position 1-3 (with 2-stage synchronizer)");
-        $display("Actual stop position: %0d\n", dut.wr_ptr_bin[ADDR_W-1:0]);  // CHANGED
-    endtask
-
-    task test_burst_transfers();
-        $display("\n========================================");
-        $display("TEST: Burst Transfers");
-        $display("========================================\n");
-        
+        // ── 3. equal clocks ───────────────────────────────────────────────
+        WR_HALF = 7.5; RD_HALF = 7.5;   // wr=15ns  rd=15ns
+        $display("\n--- 3. equal clocks (15ns/15ns) ---");
+        do_reset();
         fork
-            begin
-                $display("Writing 30 items with random gaps...");
-                write_items(30, 1);
-            end
-            begin
-                #2000;
-                $display("Reading 30 items with random gaps...");
-                te_ready = 1;
-                repeat(2000) @(posedge te_clk);
-                te_ready = 0;
-            end
+            write_words(24);
+            read_words(24);
         join
-        
-        repeat(50) @(posedge re_clk);
-        $display("Burst test complete.\n");
-    endtask
+        drain();
+        check_credits("equal");
+        check_sb("equal");
 
-    task test_overflow_protection();
-        $display("\n========================================");
-        $display("TEST: Overflow Protection");
-        $display("========================================\n");
-        
-        $display("Attempting to write %0d items (more than depth %0d)...", 
-                 DEPTH + 10, DEPTH);
-        
+
+        // ── 4. back-pressure ──────────────────────────────────────────────
+        WR_HALF = 5.0; RD_HALF = 5.0;   // wr=10ns  rd=10ns
+        $display("\n--- 4. back-pressure (10ns/10ns, random rd_ready) ---");
+        do_reset();
         fork
-            begin
-                write_items(DEPTH + 10, 0);
-            end
+            write_words(16);
+            read_words_bp(16);
         join
-        
-        repeat(50) @(posedge re_clk);
-        
-        if (re_credit == 0) begin
-            $display("✓ PASS: Buffer correctly stopped accepting writes");
-            $display("  Final credits: %0d", re_credit);
-        end else begin
-            $error("✗ FAIL: Buffer should have zero credits!");
+        drain();
+        check_credits("backpressure");
+        check_sb("backpressure");
+
+
+        // ── 5. async ratio 7:11 ───────────────────────────────────────────
+        WR_HALF = 3.5; RD_HALF = 5.5;   // wr=7ns  rd=11ns
+        $display("\n--- 5. async ratio 7:11 ---");
+        do_reset();
+        fork
+            write_words(20);
+            read_words(20);
+        join
+        drain();
+        check_credits("async_7_11");
+        check_sb("async_7_11");
+
+
+        // ── 6. fill to full, check backstop, then drain ───────────────────
+        WR_HALF = 5.0; RD_HALF = 5.0;
+        $display("\n--- 6. fill-to-full then drain ---");
+        do_reset();
+        rd_ready = 0;
+
+        // fill until DUT raises wr_full
+        begin
+            int written = 0;
+            @(posedge wr_clk);
+            while (!dut.wr_full) begin
+                wr_valid = 1;
+                wr_data  = $urandom();
+                @(posedge wr_clk);
+                scoreboard.push_back(wr_data);
+                wr_count++;
+                written++;
+                wr_valid = 0;
+                @(posedge wr_clk);  // one idle so full propagates
+            end
+            $display("  wrote %0d entries before full", written);
         end
-        
-        $display("Flushing buffer...");
-        te_ready = 1;
-        repeat(100) @(posedge te_clk);
-        te_ready = 0;
-        repeat(20) @(posedge re_clk);
-    endtask
 
-    initial begin
-        $display("\n");
-        $display("╔═══════════════════════════════════════════════════════╗");
-        $display("║     DUAL-CLOCK FIFO TESTBENCH WITH CDC ANALYSIS       ║");
-        $display("╚═══════════════════════════════════════════════════════╝");
-        $display("\nConfiguration:");
-        $display("  Buffer Depth: %0d", DEPTH);
-        $display("  Data Width: %0d bits", WIDTH);
-        $display("  Write Clock: %0.1f MHz", 1000.0/WR_CLK_PERIOD);
-        $display("  Read Clock: %0.1f MHz", 1000.0/RD_CLK_PERIOD);
-        $display("  Synchronizer stages: 2");
-        $display("\n");
+        // extra write attempt must be blocked
+        @(posedge wr_clk);
+        wr_valid = 1; wr_data = 32'hDEAD_BEEF;
+        @(posedge wr_clk);
+        if (!dut.wr_full)
+            $error("[full_drain] OVERFLOW: wrote into a full FIFO");
+        else
+            $display("[full_drain] PASS  overflow correctly blocked");
+        wr_valid = 0;
 
-        reset_system();
+        drain();
+        check_credits("full_drain");
+        check_sb("full_drain");
 
-        test_burst_transfers();
-        reset_system();
-        
-        test_overflow_protection();
-        reset_system();
-        
-        test_cdc_latency();
-        reset_system();
-        
-        test_wraparound_scenario();
-        $display("\nDraining remaining buffer contents...");
-        te_ready = 1;
-        repeat(200) @(posedge te_clk); 
-        te_ready = 0;
-        
-        repeat(50) @(posedge re_clk);
-        
-        $display("After drain: Pending items = %0d\n", expected_data_queue.size());
-        
-        $display("\n");
-        $display("╔═══════════════════════════════════════════════════════╗");
-        $display("║                    TEST SUMMARY                       ║");
-        $display("╚═══════════════════════════════════════════════════════╝");
-        $display("  Total Writes: %0d", write_count);
-        $display("  Total Reads: %0d", read_count);
-        $display("  Errors: %0d", error_count);
-        $display("  Pending in queue: %0d", expected_data_queue.size());
-        
-        if (error_count == 0 && expected_data_queue.size() == 0) begin
-            $display("\n  ✓✓✓ ALL TESTS PASSED ✓✓✓\n");
-        end else begin
-            $display("\n  ✗✗✗ TESTS FAILED ✗✗✗\n");
-        end
-        
+
+        // ── Done ──────────────────────────────────────────────────────────
+        repeat (20) @(posedge wr_clk);
+        $display("\n=== all scenarios complete ===");
         $finish;
     end
 
+    // Watchdog
     initial begin
-        $dumpfile("buffer_tb.vcd");
-        $dumpvars(0, buffer_tb);
+        #1_000_000;
+        $error("[WATCHDOG] simulation exceeded 1ms");
+        $finish;
     end
 
 endmodule
