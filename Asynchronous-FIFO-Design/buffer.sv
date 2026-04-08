@@ -30,14 +30,15 @@ module async_fifo_credit #(
 ) (
     // Write domain
     input  logic              wr_clk,           // source clock
-    input  logic              wr_rst_n,         // negative reset
+    input  logic              mst_rst_n,         // negative reset
     input  logic              wr_valid,         // source has data
     input  logic [DATA_W-1:0] wr_data,          // data_in
     output logic              wr_credit_pulse,  // 1-cycle pulse per completed read
 
     // Read domain
     input  logic              rd_clk,           // receiver clock
-    input  logic              rd_rst_n,         // negative reset
+    // master reset from write domain
+    // input  logic              rd_rst_n,         // negative reset
     output logic              rd_valid,         // data available
     input  logic              rd_ready,         // consumer accepts
     output logic [DATA_W-1:0] rd_data           // data_out
@@ -65,8 +66,8 @@ module async_fifo_credit #(
 
 
     // Write Domain
-    always_ff @(posedge wr_clk or negedge wr_rst_n)
-        if (!wr_rst_n) wr_ptr_bin <= '0;
+    always_ff @(posedge wr_clk or negedge mst_rst_n)
+        if (!mst_rst_n) wr_ptr_bin <= '0;
         else if (wr_valid && !wr_full) wr_ptr_bin <= wr_ptr_bin + 1'b1;
 
     always_ff @(posedge wr_clk)
@@ -81,16 +82,16 @@ module async_fifo_credit #(
     assign rd_valid = !rd_empty;
     assign rd_data  = mem[rd_ptr_bin[ADDR_W-1:0]];
 
-    always_ff @(posedge rd_clk or negedge rd_rst_n)
-        if (!rd_rst_n) rd_ptr_bin <= '0;
+    always_ff @(posedge rd_clk or negedge g_mst_rst_n)
+        if (!g_mst_rst_n) rd_ptr_bin <= '0;
         else if (rd_valid && rd_ready) rd_ptr_bin <= rd_ptr_bin + 1'b1;
 
     assign rd_ptr_gray = rd_ptr_bin ^ (rd_ptr_bin >> 1); // bin → Gray
 
 
     // CREDIT TOGGLE  (rd_clk)
-    always_ff @(posedge rd_clk or negedge rd_rst_n)
-        if (!rd_rst_n) credit_toggle_rd <= 1'b0;
+    always_ff @(posedge rd_clk or negedge g_mst_rst_n)
+        if (!g_mst_rst_n) credit_toggle_rd <= 1'b0;
         else if (rd_valid && rd_ready) credit_toggle_rd <= ~credit_toggle_rd;
 
 
@@ -116,7 +117,7 @@ module async_fifo_credit #(
     // CDC PATH 1  wr_ptr_gray → rd domain
     cdc_sync #(.W(PTR_W)) u_sync_wr_ptr (
         .clk   (rd_clk),
-        .rst_n (rd_rst_n),
+        .rst_n (g_mst_rst_n),
         .d     (wr_ptr_gray),
         .q     (wr_ptr_gray_sync_rd)
     );
@@ -124,7 +125,7 @@ module async_fifo_credit #(
     // CDC PATH 2  rd_ptr_gray → wr domain
     cdc_sync #(.W(PTR_W)) u_sync_rd_ptr (
         .clk   (wr_clk),
-        .rst_n (wr_rst_n),
+        .rst_n (mst_rst_n),
         .d     (rd_ptr_gray),
         .q     (rd_ptr_gray_sync_wr)
     );
@@ -132,13 +133,21 @@ module async_fifo_credit #(
     // CDC PATH 3  credit_toggle → wr domain
     cdc_sync #(.W(1)) u_sync_credit (
         .clk   (wr_clk),
-        .rst_n (wr_rst_n),
+        .rst_n (mst_rst_n),
         .d     (credit_toggle_rd),
         .q     (credit_toggle_sync_wr)
     );
 
-    always_ff @(posedge wr_clk or negedge wr_rst_n)
-        if (!wr_rst_n) credit_toggle_prev_wr <= 1'b0;
+    // CDC PATH 4  mst_rst_n → read_domain
+    cdc_sync #(.W(1)) u_sync_mst_rst_n (
+        .clk   (rd_clk),
+        .rst_n (mst_rst_n),
+        .d     (mst_rst_n),
+        .q     (g_mst_rst_n)
+    );
+
+    always_ff @(posedge wr_clk or negedge mst_rst_n)
+        if (!mst_rst_n) credit_toggle_prev_wr <= 1'b0;
         else           credit_toggle_prev_wr <= credit_toggle_sync_wr;
 
     assign wr_credit_pulse = credit_toggle_sync_wr ^ credit_toggle_prev_wr;
